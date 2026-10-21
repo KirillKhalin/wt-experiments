@@ -29,7 +29,7 @@ def evaluate_model(ckpt_path: str, config: dict):
     num_cont = dataset_cfg["num_cont_features"]
     num_cat = dataset_cfg["num_cat_features"]
     emb_dim = model_cfg["emb_dim"]
-    n_gaussians = model_cfg["n_gaussians"]
+    n_gaussians = model_cfg.get["n_gaussians"]
     dcn_dropout = model_cfg.get("dcn_dropout", 0.1)
     time_scale = dataset_cfg["time_scale"]
 
