@@ -44,10 +44,10 @@ class ResNetDecoderEGMN(torch.nn.Module):
             for dim in self.head_dims
         ])
 
-        def forward(self, encoded_vector: torch.Tensor) -> torch.Tensor:
-            shared_rep = self.common_tower(encoded_vector)
-            logits_list = [tower(shared_rep) for tower in self.tower]
-            return torch.cat(logits_list, dim=1)
+    def forward(self, encoded_vector: torch.Tensor) -> torch.Tensor:
+        shared_rep = self.common_tower(encoded_vector)
+        logits_list = [tower(shared_rep) for tower in self.tower]
+        return torch.cat(logits_list, dim=1)
 
 from hegm.model import (
     FeatureEmbedder,
