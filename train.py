@@ -6,6 +6,7 @@ import torch
 import lightning as L
 from lightning.pytorch.callbacks import ModelCheckpoint
 from lightning.pytorch.loggers import CometLogger
+from hegm.model import CommonResNet, ResNet
 import argparse
 
 class ResNetDecoderVR(torch.nn.Module):
@@ -21,6 +22,32 @@ class ResNetDecoderVR(torch.nn.Module):
 
     def forward(self, encoded_vector: torch.Tensor) -> torch.Tensor:
         return self.net(encoded_vector).squeeze(-1)
+    
+class ResNetDecoderEGMN(torch.nn.Module):
+    def __init__(self, flattened_dim: int, n_gaussians: int = 3, dropout: float = 0.1):
+        super().__init__()
+        self.n_gaussians = n_gaussians
+        # lambda (1), mu_shift (K), sigma (K), weights (K+1)
+        self.head_dims = [1, n_gaussians, n_gaussians, n_gaussians + 1]
+
+        self.common_tower = torch.nn.Sequential(
+            torch.nn.LeakyReLU(), CommonResNet(flattened_dim, dropout=dropout)
+        )
+
+        self.tower = torch.nn.ModuleList([
+            torch.nn.Sequential(
+                ResNet(flattened_dim=flattened_dim, dropout=dropout),
+                torch.nn.LeakyReLU(),
+                torch.nn.LayerNorm(flattened_dim),
+                torch.nn.Linear(flattened_dim, dim),
+            )
+            for dim in self.head_dims
+        ])
+
+        def forward(self, encoded_vector: torch.Tensor) -> torch.Tensor:
+            shared_rep = self.common_tower(encoded_vector)
+            logits_list = [tower(shared_rep) for tower in self.tower]
+            return torch.cat(logits_list, dim=1)
 
 from hegm.model import (
     FeatureEmbedder,
@@ -112,6 +139,74 @@ class VRTrainer(BaseTrainer):
         self.val_correct_pairs += corrects.item()
         self.val_total_pairs += totals.item()
 
+# took from paper of HEGM
+def egmn_loss(scores, y, n_gaussians, lambda_ent=0.1, lambda_reg=1.0):
+    lambda_logit = scores[:, 0:1]
+    mu_shift_logit = scores[:, 1 : 1 + n_gaussians]
+    sigma_logit = scores[:, 1 + n_gaussians : 1 + 2 * n_gaussians]
+    weights_logit = scores[:, 1 + 2 * n_gaussians :]
+
+    lmbda = torch.nn.functional.softplus(lambda_logit) + 1e-6
+    sigma = torch.nn.functional.softplus(sigma_logit) + 1e-6
+    
+    mu_shift = torch.nn.functional.softplus(mu_shift_logit)
+    mu = (1.0 / lmbda) + mu_shift
+    
+    weights = torch.nn.functional.softmax(weights_logit, dim=-1)
+    w_exp = weights[:, 0:1]
+    w_gauss = weights[:, 1:]
+
+    # NLL Loss
+    log_prob_exp = torch.log(lmbda) - lmbda * y.unsqueeze(1)
+    var = sigma ** 2
+    log_prob_gauss = -0.5 * torch.log(2 * torch.pi * var) - ((y.unsqueeze(1) - mu) ** 2) / (2 * var)
+    
+    log_p_exp = torch.log(w_exp + 1e-10) + log_prob_exp
+    log_p_gauss = torch.log(w_gauss + 1e-10) + log_prob_gauss
+    
+    log_p_all = torch.cat([log_p_exp, log_p_gauss], dim=1)
+    nll = -torch.logsumexp(log_p_all, dim=1).mean()
+
+    # Entropy Loss
+    entropy_loss = torch.sum(weights * torch.log(weights + 1e-10), dim=-1).mean()
+
+    # Reg Loss (MAE)
+    expected_y = w_exp * (1.0 / lmbda) + torch.sum(w_gauss * mu, dim=1, keepdim=True)
+    reg_loss = torch.nn.functional.l1_loss(expected_y.squeeze(1), y)
+
+    total_loss = nll + lambda_ent * entropy_loss + lambda_reg * reg_loss
+    return total_loss, nll, reg_loss, expected_y.squeeze(1)
+
+class EGMNTrainer(BaseTrainer):
+    def __init__(self, model, lr, n_gaussians):
+        super().__init__(model, lr)
+        self.n_gaussians = n_gaussians
+        
+    def training_step(self, batch, batch_idx):
+        y = batch["consumption_time"]
+        u_id = batch.get("user_id", None)
+        i_id = batch.get("item_id", None)
+        scores = self.model(batch["num_features"], batch["cat_features"], user_id=u_id, item_id=i_id)
+        
+        loss, nll, mae, _ = egmn_loss(scores, y, self.n_gaussians)
+        self.log("train/loss", loss, on_step=True, on_epoch=True)
+        self.log("train/nll", nll, on_step=False, on_epoch=True)
+        self.log("train/mae", mae, on_step=False, on_epoch=True)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        y = batch["consumption_time"]
+        u_id = batch.get("user_id", None)
+        i_id = batch.get("item_id", None)
+        scores = self.model(batch["num_features"], batch["cat_features"], user_id=u_id, item_id=i_id)
+        
+        _, _, mae, preds = egmn_loss(scores, y, self.n_gaussians)
+        self.final_val_mae = mae.item()
+
+        corrects, totals = batch_roc_auc_consumptions(y, preds)
+        self.val_correct_pairs += corrects.item()
+        self.val_total_pairs += totals.item()
+
 def main(config_path: str):
     try:
         with open(config_path, "r") as f:
@@ -185,6 +280,9 @@ def main(config_path: str):
     elif model_type == "vr":
         ranker.decoder = ResNetDecoderVR(flattened_dim)
         lightning_model = VRTrainer(model=ranker, lr=lr)
+    elif model_type == "egmn":
+        ranker.decoder = ResNetDecoderEGMN(flattened_dim, n_gaussians)
+        lightning_model = EGMNTrainer(model=ranker, lr=lr, n_gaussians=n_gaussians)
     else:
         raise ValueError(f"Unknown model type: {model_type}")
 
