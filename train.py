@@ -128,7 +128,7 @@ def main(config_path: str):
     dataset_name = dataset_cfg["name"]
 
     emb_dim = model_cfg["emb_dim"]
-    n_gaussians = model_cfg["n_gaussians"]
+    n_gaussians = model_cfg.get("n_gaussians")
     dcn_dropout = model_cfg.get("dcn_dropout", 0.1)
 
     batch_size = training_cfg["batch_size"]
