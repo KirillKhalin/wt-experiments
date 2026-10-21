@@ -54,6 +54,10 @@ class BaseTrainer(L.LightningModule):
     def on_validation_epoch_end(self):
         if self.val_total_pairs > 0:
             self.final_val_auc = self.val_correct_pairs / self.val_total_pairs
+            self.log("val/xauc", self.final_val_auc, on_epoch=True, prog_bar=True, logger=True
+        
+        if hasattr(self, 'final_val_mae'):
+            self.log("val/mae", self.final_val_mae, on_epoch=True, prog_bar=True, logger=True)
 
 
 class HEGMTrainer(BaseTrainer):
