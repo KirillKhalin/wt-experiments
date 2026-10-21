@@ -5,7 +5,22 @@ import yaml
 import torch
 import lightning as L
 from lightning.pytorch.callbacks import ModelCheckpoint
+from lightning.pytorch.loggers import CometLogger
 import argparse
+
+class ResNetDecoderVR(torch.nn.Module):
+    def __init__(self, flattened_dim: int):
+        super().__init__()
+        self.net = torch.nn.Sequential(
+            torch.nn.Linear(flattened_dim, flattened_dim // 2),
+            torch.nn.LeakyReLU(),
+            torch.nn.LayerNorm(flattened_dim // 2),
+            torch.nn.Linear(flattened_dim // 2, 1),
+            torch.nn.Softplus()
+        )
+
+    def forward(self, encoded_vector: torch.Tensor) -> torch.Tensor:
+        return self.net(encoded_vector).squeeze(-1)
 
 from hegm.model import (
     FeatureEmbedder,
@@ -67,6 +82,31 @@ class HEGMTrainer(BaseTrainer):
         self.val_correct_pairs += corrects.item()
         self.val_total_pairs += totals.item()
 
+class VRTrainer(BaseTrainer):
+    def training_step(self, batch, batch_idx):
+        y = batch["consumption_time"]
+        u_id = batch.get("user_id", None)
+        i_id = batch.get("item_id", None)
+        
+        preds = self.model(batch["num_features"], batch["cat_features"], user_id=u_id, item_id=i_id)
+        
+        loss = torch.nn.functional.mse_loss(preds, y)
+        self.log("train/loss", loss, on_step=True, on_epoch=True)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        y = batch["consumption_time"]
+        u_id = batch.get("user_id", None)
+        i_id = batch.get("item_id", None)
+        
+        preds = self.model(batch["num_features"], batch["cat_features"], user_id=u_id, item_id=i_id)
+        
+        mae = torch.nn.functional.l1_loss(preds, y)
+        self.final_val_mae = mae.item()
+
+        corrects, totals = batch_roc_auc_consumptions(y, preds)
+        self.val_correct_pairs += corrects.item()
+        self.val_total_pairs += totals.item()
 
 def main(config_path: str):
     try:
@@ -133,21 +173,34 @@ def main(config_path: str):
         embedder, encoder, None, num_users=num_users, num_items=num_items, emb_dim=emb_dim
     )
 
-    ranker.decoder = ResNetDecoderHEGM(flattened_dim, n_gaussians)
-    lightning_model = HEGMTrainer(model=ranker, lr=lr)
+    model_type = model_cfg.get("type", "hegm")
+
+    if model_type == "hegm":
+        ranker.decoder = ResNetDecoderHEGM(flattened_dim, n_gaussians)
+        lightning_model = HEGMTrainer(model=ranker, lr=lr)
+    elif model_type == "vr":
+        ranker.decoder = ResNetDecoderVR(flattened_dim)
+        lightning_model = VRTrainer(model=ranker, lr=lr)
+    else:
+        raise ValueError(f"Unknown model type: {model_type}")
 
     datamodule = LocalDataModule(train_path, val_path, batch_size)
 
-    ckpt_dir = os.path.join("checkpoints", f"{dataset_name}_k{n_gaussians}")
+    ckpt_dir = os.path.join("checkpoints", f"{dataset_name}_{model_type}")
     checkpoint_callback = ModelCheckpoint(
         dirpath=ckpt_dir,
         filename="last",
         save_last=True,
     )
 
+    comet_logger = CometLogger(
+        project_name="watch-time-benchmark",
+        experiment_name=f"{model_type}_{dataset_name}"
+    )
+
     trainer = L.Trainer(
         max_epochs=max_epochs,
-        logger=False,
+        logger=comet_logger,
         callbacks=[checkpoint_callback],
         accelerator="auto",
         devices=1,
